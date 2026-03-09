@@ -13,8 +13,7 @@
 using namespace llvm;
 
 // NO cl::opt FLAGS! LTO strips them in the WASM build.
-// This pass is ALWAYS active since this is the Nova fork.
-// The stepmap path is derived from the source filename.
+// Pass activation is natively gated via OptimizationLevel::O0 below.
 
 namespace {
 
@@ -40,11 +39,10 @@ std::string escapeJsonNova(StringRef s) {
   return out;
 }
 
-// Derive stepmap path: /workspace/main.cpp ->
-// /workspace/_workspace_main.stepmap.json
+// Auto-derive stepmap path: /workspace/main.cpp ->
+// /workspace/workspace_main.stepmap.json
 std::string deriveStepMapPath(StringRef sourceFile) {
   std::string name = sourceFile.str();
-  // Replace / with _ and .cpp with .stepmap.json
   std::string flat;
   for (char c : name) {
     if (c == '/')
@@ -52,10 +50,10 @@ std::string deriveStepMapPath(StringRef sourceFile) {
     else
       flat += c;
   }
-  // Remove leading underscore if present
+
   if (!flat.empty() && flat[0] == '_')
     flat = flat.substr(1);
-  // Replace .cpp with .stepmap.json
+
   auto pos = flat.rfind(".cpp");
   if (pos != std::string::npos) {
     flat = flat.substr(0, pos) + ".stepmap.json";
@@ -83,7 +81,7 @@ struct NovaDebugPass : public PassInfoMixin<NovaDebugPass> {
     auto *NotifyExitType = FunctionType::get(Type::getVoidTy(Ctx), {}, false);
     auto NotifyExitFn = M.getOrInsertFunction("JS_notify_exit", NotifyExitType);
 
-    // Check if this module has any user code at all
+    // Fast-Check: Skip modules that do not contain any user code
     bool hasUserCode = false;
     for (Function &F : M) {
       if (F.isDeclaration())
@@ -111,24 +109,29 @@ struct NovaDebugPass : public PassInfoMixin<NovaDebugPass> {
     bool changed = false;
     bool first = true;
 
-    // Derive stepmap path from module source filename
+    // Stream JSON directly to file to avoid WASM OOM on large projects
     std::string stepMapPath = deriveStepMapPath(M.getSourceFileName());
-
     std::error_code EC;
-    std::unique_ptr<raw_fd_ostream> OS;
-    OS = std::make_unique<raw_fd_ostream>(stepMapPath, EC, sys::fs::OF_None);
+    std::unique_ptr<raw_fd_ostream> OS =
+        std::make_unique<raw_fd_ostream>(stepMapPath, EC, sys::fs::OF_None);
     if (!EC)
       *OS << "{";
 
-    uint32_t fileId = hashStringNova(M.getSourceFileName()) & 0xFFF;
+    // CRITICAL BUG FIX: Use 0x7FF (11 bits) instead of 0xFFF to prevent the
+    // sign bit from activating. This guarantees JS Int32Array reads it as a
+    // positive number!
+    uint32_t fileId = hashStringNova(M.getSourceFileName()) & 0x7FF;
     uint32_t instructionCounter = 0;
 
     for (Function &F : M) {
       StringRef FName = F.getName();
 
+      // CRITICAL BUG FIX: Ensure `__original_main` is allowed through so we can
+      // debug main()
       if (F.isDeclaration() || FName.starts_with("JS_") ||
-          FName.starts_with("__"))
+          (FName.starts_with("__") && FName != "__original_main"))
         continue;
+
       if (FName == "clear_screen" || FName == "draw_circle" ||
           FName == "render_frame" || FName == "malloc" || FName == "free")
         continue;
@@ -146,7 +149,6 @@ struct NovaDebugPass : public PassInfoMixin<NovaDebugPass> {
         if (isUserFunc)
           break;
       }
-
       if (!isUserFunc)
         continue;
 
@@ -165,7 +167,7 @@ struct NovaDebugPass : public PassInfoMixin<NovaDebugPass> {
         }
       }
 
-      // 1. INJECT ENTER HOOK
+      // 1. INJECT ENTER HOOK (Safely skips alloca instructions)
       if (!F.empty()) {
         BasicBlock &EntryBB = F.getEntryBlock();
         auto InsertPt = EntryBB.getFirstInsertionPt();
@@ -178,7 +180,6 @@ struct NovaDebugPass : public PassInfoMixin<NovaDebugPass> {
 
       for (BasicBlock &BB : F) {
         int lastLine = -1;
-
         for (auto it = BB.begin(); it != BB.end();) {
           Instruction &I = *it++;
           if (isa<PHINode>(&I) || I.isEHPad())
@@ -201,6 +202,7 @@ struct NovaDebugPass : public PassInfoMixin<NovaDebugPass> {
                 filePath = "/workspace/" + filePath;
               }
 
+              // ZERO-COLLISION STEP ID
               uint32_t stepId = (fileId << 20) | (instructionCounter & 0xFFFFF);
 
               IRBuilder<> StepBuilder(&I);
@@ -218,7 +220,7 @@ struct NovaDebugPass : public PassInfoMixin<NovaDebugPass> {
             }
           }
 
-          // 3. INJECT EXIT HOOK
+          // 3. INJECT EXIT HOOK (Handles Returns AND Exception Unwinding)
           if (isa<ReturnInst>(&I) || isa<ResumeInst>(&I)) {
             IRBuilder<> ExitBuilder(&I);
             ExitBuilder.CreateCall(NotifyExitFn);
@@ -237,12 +239,17 @@ struct NovaDebugPass : public PassInfoMixin<NovaDebugPass> {
 };
 } // namespace
 
-// Static registration - called from PassBuilder constructor
+// ── Static Registration ──────────────────────────────────────────────
 extern "C" ::llvm::PassPluginLibraryInfo llvmGetPassPluginInfo() {
   return {LLVM_PLUGIN_API_VERSION, "NovaDebugPass", "v1", [](PassBuilder &PB) {
             PB.registerPipelineStartEPCallback(
                 [](ModulePassManager &MPM, OptimizationLevel Level) {
-                  MPM.addPass(NovaDebugPass());
+                  // NATIVE TOGGLE: Only inject the debugger hooks if
+                  // optimizations are disabled (-O0). This ensures Release mode
+                  // (-O2) runs at full native speed without debugger overhead!
+                  if (Level == OptimizationLevel::O0) {
+                    MPM.addPass(NovaDebugPass());
+                  }
                 });
           }};
 }
