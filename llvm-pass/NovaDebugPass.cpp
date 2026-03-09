@@ -1,3 +1,4 @@
+#include "llvm/Demangle/Demangle.h"
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
@@ -8,34 +9,25 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/JSON.h"
 #include "llvm/Support/raw_ostream.h"
+#include <memory>
 #include <string>
+#include <vector>
 
 using namespace llvm;
 
 namespace {
 
+// Deterministic hashing is REQUIRED so the Web Worker .o caching works!
+// (llvm::hash_value is randomized per-process and would break cache hits)
 uint32_t hashStringNova(StringRef Str) {
   uint32_t Hash = 2166136261u;
   for (char C : Str) {
     Hash ^= (uint8_t)C;
     Hash *= 16777619u;
   }
-  return Hash & 0x7FFFFFFF;
-}
-
-std::string escapeJsonNova(StringRef s) {
-  std::string out;
-  out.reserve(s.size() + 10);
-  for (char c : s) {
-    if (c == '"')
-      out += "\\\"";
-    else if (c == '\\')
-      out += "\\\\";
-    else
-      out += c;
-  }
-  return out;
+  return Hash;
 }
 
 std::string deriveStepMapPath(StringRef sourceFile) {
@@ -45,10 +37,7 @@ std::string deriveStepMapPath(StringRef sourceFile) {
 
   std::string flat;
   for (char c : name) {
-    if (c == '/')
-      flat += '_';
-    else
-      flat += c;
+    flat += (c == '/') ? '_' : c;
   }
   if (!flat.empty() && flat[0] == '_')
     flat = flat.substr(1);
@@ -62,9 +51,34 @@ std::string deriveStepMapPath(StringRef sourceFile) {
   return "/workspace/" + flat;
 }
 
+// Cleanly isolate platform-specific IDE exclusions
+bool isNovaRuntime(StringRef Name) {
+  return Name.starts_with("JS_") || Name == "clear_screen" ||
+         Name == "draw_circle" || Name == "render_frame" || Name == "malloc" ||
+         Name == "free" || Name == "__wrap_malloc" || Name == "__wrap_free";
+}
+
 bool isUserSourceFile(StringRef file) {
   return file.contains("workspace") || file.contains("main.cpp");
 }
+
+// Safely bypass all variable allocations to protect the WASM shadow stack
+Instruction *getSafeInsertionPoint(BasicBlock &BB) {
+  auto InsertPt = BB.getFirstInsertionPt();
+  while (InsertPt != BB.end() &&
+         (isa<AllocaInst>(&*InsertPt) || isa<DbgInfoIntrinsic>(&*InsertPt))) {
+    ++InsertPt;
+  }
+  return InsertPt == BB.end() ? nullptr : &*InsertPt;
+}
+
+// Memory-safe struct to hold StepMap entries before streaming
+struct StepMapEntry {
+  uint32_t stepId;
+  int line;
+  std::string func;
+  std::string file;
+};
 
 struct NovaDebugPass : public PassInfoMixin<NovaDebugPass> {
   PreservedAnalyses run(Module &M, ModuleAnalysisManager &MAM) {
@@ -101,88 +115,75 @@ struct NovaDebugPass : public PassInfoMixin<NovaDebugPass> {
         break;
     }
 
-    // Skip stdlib-only modules entirely
     if (!hasUserCode)
       return PreservedAnalyses::all();
 
     bool changed = false;
-    bool first = true;
+    std::vector<StepMapEntry> StepMap;
 
-    // Build JSON in memory to avoid filesystem streaming traps
-    std::string jsonStr = "{";
-
-    uint32_t fileId = hashStringNova(M.getSourceFileName()) & 0x7FF;
+    // 14 bits for fileId (16,384 files), 17 bits for Instruction (131,072 per
+    // file). This perfectly fits in 31 bits, guaranteeing it never hits the JS
+    // Int32 sign bit!
+    uint32_t fileId = hashStringNova(M.getSourceFileName()) & 0x3FFF;
     uint32_t instructionCounter = 0;
 
     for (Function &F : M) {
       StringRef FName = F.getName();
 
-      if (F.isDeclaration() || FName.starts_with("JS_") ||
+      if (F.isDeclaration() || isNovaRuntime(FName) ||
           (FName.starts_with("__") && FName != "__original_main"))
         continue;
 
-      if (FName == "clear_screen" || FName == "draw_circle" ||
-          FName == "render_frame" || FName == "malloc" || FName == "free")
-        continue;
-
       bool isUserFunc = false;
+      DebugLoc FirstValidDL;
+
       for (BasicBlock &BB : F) {
         for (Instruction &I : BB) {
           if (const DebugLoc &DL = I.getDebugLoc()) {
+            if (!FirstValidDL)
+              FirstValidDL = DL;
             if (isUserSourceFile(DL->getFilename())) {
               isUserFunc = true;
-              break;
             }
           }
         }
-        if (isUserFunc)
-          break;
       }
       if (!isUserFunc)
         continue;
 
-      // Clean function name for UI
+      // Use LLVM's native C++ demangler
       std::string cleanFuncName = FName.str();
-      if (cleanFuncName == "__original_main")
+      if (cleanFuncName == "__original_main") {
         cleanFuncName = "main";
-      else if (cleanFuncName.find("_Z") == 0) {
-        size_t i = 2;
-        int len = 0;
-        while (i < cleanFuncName.length() && cleanFuncName[i] >= '0' &&
-               cleanFuncName[i] <= '9') {
-          len = len * 10 + (cleanFuncName[i] - '0');
-          i++;
-        }
-        if (len > 0 && i + len <= cleanFuncName.length()) {
-          cleanFuncName = cleanFuncName.substr(i, len);
+      } else {
+        std::string demangled = demangle(cleanFuncName);
+        if (!demangled.empty()) {
+          // Strip parameters for a cleaner UI (e.g.,
+          // "Node::doubleValues(Node*)" -> "Node::doubleValues")
+          auto parenPos = demangled.find('(');
+          if (parenPos != std::string::npos) {
+            cleanFuncName = demangled.substr(0, parenPos);
+          } else {
+            cleanFuncName = demangled;
+          }
         }
       }
 
-      // Manufacture a fallback DebugLoc from the function's DISubprogram
-      // to satisfy the strict LLVM IR Verifier
       DISubprogram *SP = F.getSubprogram();
       DebugLoc FuncDL;
-      if (SP) {
+      if (SP)
         FuncDL = DILocation::get(Ctx, SP->getLine(), 0, SP);
-      }
 
       // 1. INJECT ENTER HOOK (Safely skips alloca instructions)
       if (!F.empty()) {
-        BasicBlock &EntryBB = F.getEntryBlock();
-        auto InsertPt = EntryBB.getFirstInsertionPt();
+        if (Instruction *SafeInsertPt =
+                getSafeInsertionPoint(F.getEntryBlock())) {
+          IRBuilder<> Builder(SafeInsertPt);
 
-        // Protect WebAssembly shadow stack by skipping ALL static Allocas
-        while (InsertPt != EntryBB.end() &&
-               (isa<AllocaInst>(&*InsertPt) ||
-                isa<DbgInfoIntrinsic>(&*InsertPt))) {
-          ++InsertPt;
-        }
-
-        if (InsertPt != EntryBB.end()) {
-          IRBuilder<> Builder(&*InsertPt);
-
-          if (InsertPt->getDebugLoc())
-            Builder.SetCurrentDebugLocation(InsertPt->getDebugLoc());
+          if (SafeInsertPt->getDebugLoc())
+            Builder.SetCurrentDebugLocation(SafeInsertPt->getDebugLoc());
+          else if (FirstValidDL)
+            Builder.SetCurrentDebugLocation(FirstValidDL);
           else if (FuncDL)
             Builder.SetCurrentDebugLocation(FuncDL);
 
@@ -191,7 +192,7 @@ struct NovaDebugPass : public PassInfoMixin<NovaDebugPass> {
         }
       }
 
-      DebugLoc LastValidDL;
+      DebugLoc LastValidDL = FirstValidDL ? FirstValidDL : FuncDL;
 
       for (BasicBlock &BB : F) {
         int lastLine = -1;
@@ -222,21 +223,15 @@ struct NovaDebugPass : public PassInfoMixin<NovaDebugPass> {
                 filePath = "/workspace/" + filePath;
               }
 
-              // ZERO-COLLISION STEP ID
-              uint32_t stepId = (fileId << 20) | (instructionCounter & 0xFFFFF);
+              uint32_t stepId = (fileId << 17) | (instructionCounter & 0x1FFFF);
 
               IRBuilder<> StepBuilder(&I);
               StepBuilder.SetCurrentDebugLocation(DL);
               StepBuilder.CreateCall(StepFn, {StepBuilder.getInt32(stepId)});
               changed = true;
 
-              if (!first)
-                jsonStr += ",";
-              jsonStr += "\"" + std::to_string(stepId) +
-                         "\":{\"line\":" + std::to_string(line) +
-                         ",\"func\":\"" + escapeJsonNova(cleanFuncName) +
-                         "\",\"file\":\"" + escapeJsonNova(filePath) + "\"}";
-              first = false;
+              // Store locally to safely emit JSON later
+              StepMap.push_back({stepId, line, cleanFuncName, filePath});
             }
           }
 
@@ -247,20 +242,16 @@ struct NovaDebugPass : public PassInfoMixin<NovaDebugPass> {
             // Prevent Verifier abort on MustTail calls
             if (auto *Prev = I.getPrevNode()) {
               if (auto *CB = dyn_cast<CallBase>(Prev)) {
-                if (CB->isMustTailCall()) {
+                if (CB->isMustTailCall())
                   InsertPt = Prev;
-                }
               }
             }
 
             IRBuilder<> ExitBuilder(InsertPt);
-
             if (InsertPt->getDebugLoc())
               ExitBuilder.SetCurrentDebugLocation(InsertPt->getDebugLoc());
             else if (LastValidDL)
               ExitBuilder.SetCurrentDebugLocation(LastValidDL);
-            else if (FuncDL)
-              ExitBuilder.SetCurrentDebugLocation(FuncDL);
 
             ExitBuilder.CreateCall(NotifyExitFn);
             changed = true;
@@ -269,22 +260,34 @@ struct NovaDebugPass : public PassInfoMixin<NovaDebugPass> {
       }
     }
 
-    jsonStr += "}\n";
-
-    // Stream JSON directly to file to avoid WASM OOM on large projects
+    // Native LLVM JSON Streaming
     std::string stepMapPath = deriveStepMapPath(M.getSourceFileName());
     std::error_code EC;
     raw_fd_ostream OS(stepMapPath, EC, sys::fs::OF_None);
 
-    if (!EC) {
-      OS << jsonStr;
-      OS.flush();
-    }
+    if (EC) {
+      errs() << "NovaDebugPass Error: Failed to open step map for writing: "
+             << EC.message() << "\n";
+    } else {
+      llvm::json::OStream J(OS);
+      J.object([&] {
+        for (const auto &Entry : StepMap) {
+          J.attributeObject(std::to_string(Entry.stepId), [&] {
+            J.attribute("line", Entry.line);
+            J.attribute("func", Entry.func);
+            J.attribute("file", Entry.file);
+          });
+        }
+      });
 
-    // Clear stream errors to prevent raw_fd_ostream destructor from calling
-    // abort()
-    if (OS.has_error()) {
-      OS.clear_error();
+      OS.flush();
+
+      // Acknowledge WASI file closure errors so the WebWorker doesn't crash
+      if (OS.has_error()) {
+        errs() << "NovaDebugPass Warning: WASI encountered a flush error on "
+               << stepMapPath << "\n";
+        OS.clear_error();
+      }
     }
 
     return changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
