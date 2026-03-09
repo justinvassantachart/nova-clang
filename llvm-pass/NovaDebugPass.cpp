@@ -1,19 +1,17 @@
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/Passes/OptimizationLevel.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Passes/PassPlugin.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/raw_ostream.h"
-#include <memory>
 #include <string>
 
 using namespace llvm;
-
-// NO cl::opt FLAGS! LTO strips them in the WASM build.
-// Pass activation is natively gated via OptimizationLevel::O0 below.
 
 namespace {
 
@@ -28,6 +26,7 @@ uint32_t hashStringNova(StringRef Str) {
 
 std::string escapeJsonNova(StringRef s) {
   std::string out;
+  out.reserve(s.size() + 10);
   for (char c : s) {
     if (c == '"')
       out += "\\\"";
@@ -39,10 +38,11 @@ std::string escapeJsonNova(StringRef s) {
   return out;
 }
 
-// Auto-derive stepmap path: /workspace/main.cpp ->
-// /workspace/workspace_main.stepmap.json
 std::string deriveStepMapPath(StringRef sourceFile) {
   std::string name = sourceFile.str();
+  if (name.empty())
+    name = "unknown";
+
   std::string flat;
   for (char c : name) {
     if (c == '/')
@@ -50,7 +50,6 @@ std::string deriveStepMapPath(StringRef sourceFile) {
     else
       flat += c;
   }
-
   if (!flat.empty() && flat[0] == '_')
     flat = flat.substr(1);
 
@@ -109,25 +108,15 @@ struct NovaDebugPass : public PassInfoMixin<NovaDebugPass> {
     bool changed = false;
     bool first = true;
 
-    // Stream JSON directly to file to avoid WASM OOM on large projects
-    std::string stepMapPath = deriveStepMapPath(M.getSourceFileName());
-    std::error_code EC;
-    std::unique_ptr<raw_fd_ostream> OS =
-        std::make_unique<raw_fd_ostream>(stepMapPath, EC, sys::fs::OF_None);
-    if (!EC)
-      *OS << "{";
+    // Build JSON in memory to avoid filesystem streaming traps
+    std::string jsonStr = "{";
 
-    // CRITICAL BUG FIX: Use 0x7FF (11 bits) instead of 0xFFF to prevent the
-    // sign bit from activating. This guarantees JS Int32Array reads it as a
-    // positive number!
     uint32_t fileId = hashStringNova(M.getSourceFileName()) & 0x7FF;
     uint32_t instructionCounter = 0;
 
     for (Function &F : M) {
       StringRef FName = F.getName();
 
-      // CRITICAL BUG FIX: Ensure `__original_main` is allowed through so we can
-      // debug main()
       if (F.isDeclaration() || FName.starts_with("JS_") ||
           (FName.starts_with("__") && FName != "__original_main"))
         continue;
@@ -158,31 +147,62 @@ struct NovaDebugPass : public PassInfoMixin<NovaDebugPass> {
         cleanFuncName = "main";
       else if (cleanFuncName.find("_Z") == 0) {
         size_t i = 2;
+        int len = 0;
         while (i < cleanFuncName.length() && cleanFuncName[i] >= '0' &&
-               cleanFuncName[i] <= '9')
+               cleanFuncName[i] <= '9') {
+          len = len * 10 + (cleanFuncName[i] - '0');
           i++;
-        if (i > 2) {
-          int len = std::stoi(cleanFuncName.substr(2, i - 2));
+        }
+        if (len > 0 && i + len <= cleanFuncName.length()) {
           cleanFuncName = cleanFuncName.substr(i, len);
         }
+      }
+
+      // Manufacture a fallback DebugLoc from the function's DISubprogram
+      // to satisfy the strict LLVM IR Verifier
+      DISubprogram *SP = F.getSubprogram();
+      DebugLoc FuncDL;
+      if (SP) {
+        FuncDL = DILocation::get(Ctx, SP->getLine(), 0, SP);
       }
 
       // 1. INJECT ENTER HOOK (Safely skips alloca instructions)
       if (!F.empty()) {
         BasicBlock &EntryBB = F.getEntryBlock();
         auto InsertPt = EntryBB.getFirstInsertionPt();
+
+        // Protect WebAssembly shadow stack by skipping ALL static Allocas
+        while (InsertPt != EntryBB.end() &&
+               (isa<AllocaInst>(&*InsertPt) ||
+                isa<DbgInfoIntrinsic>(&*InsertPt))) {
+          ++InsertPt;
+        }
+
         if (InsertPt != EntryBB.end()) {
           IRBuilder<> Builder(&*InsertPt);
+
+          if (InsertPt->getDebugLoc())
+            Builder.SetCurrentDebugLocation(InsertPt->getDebugLoc());
+          else if (FuncDL)
+            Builder.SetCurrentDebugLocation(FuncDL);
+
           Builder.CreateCall(NotifyEnterFn);
           changed = true;
         }
       }
 
+      DebugLoc LastValidDL;
+
       for (BasicBlock &BB : F) {
         int lastLine = -1;
         for (auto it = BB.begin(); it != BB.end();) {
           Instruction &I = *it++;
-          if (isa<PHINode>(&I) || I.isEHPad())
+
+          if (I.getDebugLoc())
+            LastValidDL = I.getDebugLoc();
+
+          // Skip AllocaInst to protect the WebAssembly shadow stack
+          if (isa<PHINode>(&I) || I.isEHPad() || isa<AllocaInst>(&I))
             continue;
 
           // 2. INJECT STEP HOOK
@@ -206,23 +226,42 @@ struct NovaDebugPass : public PassInfoMixin<NovaDebugPass> {
               uint32_t stepId = (fileId << 20) | (instructionCounter & 0xFFFFF);
 
               IRBuilder<> StepBuilder(&I);
+              StepBuilder.SetCurrentDebugLocation(DL);
               StepBuilder.CreateCall(StepFn, {StepBuilder.getInt32(stepId)});
               changed = true;
 
-              if (OS && !EC) {
-                if (!first)
-                  *OS << ",";
-                *OS << "\"" << stepId << "\":{\"line\":" << line
-                    << ",\"func\":\"" << escapeJsonNova(cleanFuncName)
-                    << "\",\"file\":\"" << escapeJsonNova(filePath) << "\"}";
-                first = false;
-              }
+              if (!first)
+                jsonStr += ",";
+              jsonStr += "\"" + std::to_string(stepId) +
+                         "\":{\"line\":" + std::to_string(line) +
+                         ",\"func\":\"" + escapeJsonNova(cleanFuncName) +
+                         "\",\"file\":\"" + escapeJsonNova(filePath) + "\"}";
+              first = false;
             }
           }
 
           // 3. INJECT EXIT HOOK (Handles Returns AND Exception Unwinding)
           if (isa<ReturnInst>(&I) || isa<ResumeInst>(&I)) {
-            IRBuilder<> ExitBuilder(&I);
+            Instruction *InsertPt = &I;
+
+            // Prevent Verifier abort on MustTail calls
+            if (auto *Prev = I.getPrevNode()) {
+              if (auto *CB = dyn_cast<CallBase>(Prev)) {
+                if (CB->isMustTailCall()) {
+                  InsertPt = Prev;
+                }
+              }
+            }
+
+            IRBuilder<> ExitBuilder(InsertPt);
+
+            if (InsertPt->getDebugLoc())
+              ExitBuilder.SetCurrentDebugLocation(InsertPt->getDebugLoc());
+            else if (LastValidDL)
+              ExitBuilder.SetCurrentDebugLocation(LastValidDL);
+            else if (FuncDL)
+              ExitBuilder.SetCurrentDebugLocation(FuncDL);
+
             ExitBuilder.CreateCall(NotifyExitFn);
             changed = true;
           }
@@ -230,8 +269,22 @@ struct NovaDebugPass : public PassInfoMixin<NovaDebugPass> {
       }
     }
 
-    if (OS && !EC) {
-      *OS << "}\n";
+    jsonStr += "}\n";
+
+    // Stream JSON directly to file to avoid WASM OOM on large projects
+    std::string stepMapPath = deriveStepMapPath(M.getSourceFileName());
+    std::error_code EC;
+    raw_fd_ostream OS(stepMapPath, EC, sys::fs::OF_None);
+
+    if (!EC) {
+      OS << jsonStr;
+      OS.flush();
+    }
+
+    // Clear stream errors to prevent raw_fd_ostream destructor from calling
+    // abort()
+    if (OS.has_error()) {
+      OS.clear_error();
     }
 
     return changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
