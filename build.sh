@@ -85,6 +85,10 @@ if ! [ -f llvm-tblgen-build/bin/llvm-tblgen -a -f llvm-tblgen-build/bin/clang-tb
 fi
 
 mkdir -p llvm-build
+
+# Inject Nova LLVM Debug Pass into the LLVM source tree
+python3 llvm-pass/patch_llvm.py llvm-src
+
 cmake -B llvm-build -S llvm-src/llvm \
   -DCMAKE_TOOLCHAIN_FILE=../Toolchain-WASI-LLVM.cmake \
   -DLLVM_CCACHE_BUILD=ON \
