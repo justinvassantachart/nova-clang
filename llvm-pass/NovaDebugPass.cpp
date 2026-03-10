@@ -85,23 +85,17 @@ Instruction *getSafeInsertionPoint(BasicBlock &BB) {
   return &*InsertPt;
 }
 
-Instruction *adjustForMustTail(Instruction *I) {
-  Instruction *Scan = I;
-  while (Scan) {
-    if (auto *CB = dyn_cast<CallBase>(Scan)) {
-      if (CB->isMustTailCall())
-        return Scan;
-    }
-    if (isa<ReturnInst>(Scan) || isa<BitCastInst>(Scan) ||
-        isa<IntToPtrInst>(Scan) || isa<ExtractValueInst>(Scan) ||
-        isa<DbgInfoIntrinsic>(Scan)) {
-      Scan = Scan->getPrevNode();
-      continue;
-    }
-    break;
-  }
-  return I;
-}
+// Per-hook structs prevent DebugLoc bleeding from Phase 1 → Phase 2
+struct StepHook {
+  Instruction *InsertPt;
+  uint32_t stepId;
+  DebugLoc DL;
+};
+
+struct ExitHook {
+  Instruction *InsertPt;
+  DebugLoc DL;
+};
 
 struct StepMapEntry {
   uint32_t stepId;
@@ -160,6 +154,7 @@ struct NovaDebugPass : public PassInfoMixin<NovaDebugPass> {
           (FName.starts_with("__") && FName != "__original_main"))
         continue;
 
+      // Skip naked functions and any function containing musttail calls
       bool skipFunc = F.hasFnAttribute(Attribute::Naked);
       for (BasicBlock &BB : F) {
         for (Instruction &I : BB) {
@@ -192,44 +187,40 @@ struct NovaDebugPass : public PassInfoMixin<NovaDebugPass> {
       if (!isUserFunc)
         continue;
 
-      std::string cleanFuncName = FName.str();
-      if (cleanFuncName == "__original_main")
+      // Robust demangling: DWARF metadata holds pristine source names
+      DISubprogram *SP = F.getSubprogram();
+      std::string cleanFuncName;
+      if (SP && !SP->getName().empty()) {
+        cleanFuncName = SP->getName().str();
+      } else if (FName == "__original_main") {
         cleanFuncName = "main";
-      else if (cleanFuncName.find("_Z") == 0) {
-        size_t i = 2;
-        int len = 0;
-        while (i < cleanFuncName.length() && cleanFuncName[i] >= '0' &&
-               cleanFuncName[i] <= '9') {
-          len = len * 10 + (cleanFuncName[i] - '0');
-          i++;
-        }
-        if (len > 0 && i + len <= cleanFuncName.length()) {
-          cleanFuncName = cleanFuncName.substr(i, len);
-        }
+      } else {
+        cleanFuncName = FName.str();
       }
 
-      DISubprogram *SP = F.getSubprogram();
       DebugLoc FuncDL;
       if (SP)
         FuncDL = DILocation::get(Ctx, SP->getLine(), 0, SP);
-      DebugLoc LastValidDL = FuncDL ? FuncDL : FirstValidDL;
 
       // ----------------------------------------------------------------------
       // PHASE 1: COLLECTION (Prevents WebAssembly Iterator Invalidation Traps)
       // ----------------------------------------------------------------------
       Instruction *EnterHookPt = nullptr;
-      std::vector<std::pair<Instruction *, uint32_t>> StepHooks;
-      std::vector<Instruction *> ExitHooks;
+      std::vector<StepHook> StepHooks;
+      std::vector<ExitHook> ExitHooks;
 
       if (!F.empty()) {
         EnterHookPt = getSafeInsertionPoint(F.getEntryBlock());
       }
 
+      // FIX: Hoist tracking variables OUT of the BasicBlock loop so that
+      // duplicate hooks for the same source line across block boundaries
+      // (e.g. delete, loop conditions) are correctly deduplicated.
+      int lastLine = -1;
+      StringRef lastFile = "";
+
       for (BasicBlock &BB : F) {
-        int lastLine = -1;
         for (Instruction &I : BB) {
-          if (I.getDebugLoc())
-            LastValidDL = I.getDebugLoc();
           if (isa<PHINode>(&I) || I.isEHPad() || isa<AllocaInst>(&I))
             continue;
 
@@ -237,9 +228,14 @@ struct NovaDebugPass : public PassInfoMixin<NovaDebugPass> {
             int line = DL.getLine();
             StringRef file = DL->getFilename();
 
-            if (line > 0 && line != lastLine && isUserSourceFile(file)) {
+            // Deduplicate across sequential BasicBlocks by tracking both
+            // line AND file — prevents double-stepping on delete/loops
+            if (line > 0 && (line != lastLine || file != lastFile) &&
+                isUserSourceFile(file)) {
               lastLine = line;
+              lastFile = file;
               instructionCounter++;
+
               std::string filePath = file.str();
               if (filePath.find("/workspace/") != 0 && filePath.find("./") == 0)
                 filePath = "/workspace/" + filePath.substr(2);
@@ -247,19 +243,16 @@ struct NovaDebugPass : public PassInfoMixin<NovaDebugPass> {
                 filePath = "/workspace/" + filePath;
 
               uint32_t stepId = (fileId << 17) | (instructionCounter & 0x1FFFF);
-              Instruction *InsertPt = adjustForMustTail(&I);
-              if (InsertPt) {
-                StepHooks.push_back({InsertPt, stepId});
-                StepMap.push_back({stepId, line, cleanFuncName, filePath});
-              }
+
+              // Store the DebugLoc per-hook to prevent Phase 2 bleeding
+              StepHooks.push_back({&I, stepId, DL});
+              StepMap.push_back({stepId, line, cleanFuncName, filePath});
             }
           }
 
           if (isa<ReturnInst>(&I) || isa<ResumeInst>(&I) ||
               isa<CleanupReturnInst>(&I) || isa<CatchReturnInst>(&I)) {
-            Instruction *InsertPt = adjustForMustTail(&I);
-            if (InsertPt)
-              ExitHooks.push_back(InsertPt);
+            ExitHooks.push_back({&I, I.getDebugLoc()});
           }
         }
       }
@@ -280,21 +273,22 @@ struct NovaDebugPass : public PassInfoMixin<NovaDebugPass> {
       }
 
       for (auto &Hook : StepHooks) {
-        IRBuilder<> StepBuilder(Hook.first);
-        if (Hook.first->getDebugLoc())
-          StepBuilder.SetCurrentDebugLocation(Hook.first->getDebugLoc());
-        else if (LastValidDL)
-          StepBuilder.SetCurrentDebugLocation(LastValidDL);
-        StepBuilder.CreateCall(StepFn, {StepBuilder.getInt32(Hook.second)});
+        IRBuilder<> StepBuilder(Hook.InsertPt);
+        // Use the per-hook DL, not a global that bled to the last instruction
+        if (Hook.DL)
+          StepBuilder.SetCurrentDebugLocation(Hook.DL);
+        else if (FirstValidDL)
+          StepBuilder.SetCurrentDebugLocation(FirstValidDL);
+        StepBuilder.CreateCall(StepFn, {StepBuilder.getInt32(Hook.stepId)});
         changed = true;
       }
 
-      for (auto *InsertPt : ExitHooks) {
-        IRBuilder<> ExitBuilder(InsertPt);
-        if (InsertPt->getDebugLoc())
-          ExitBuilder.SetCurrentDebugLocation(InsertPt->getDebugLoc());
-        else if (LastValidDL)
-          ExitBuilder.SetCurrentDebugLocation(LastValidDL);
+      for (auto &Hook : ExitHooks) {
+        IRBuilder<> ExitBuilder(Hook.InsertPt);
+        if (Hook.DL)
+          ExitBuilder.SetCurrentDebugLocation(Hook.DL);
+        else if (FirstValidDL)
+          ExitBuilder.SetCurrentDebugLocation(FirstValidDL);
         else if (FuncDL)
           ExitBuilder.SetCurrentDebugLocation(FuncDL);
         ExitBuilder.CreateCall(NotifyExitFn);
