@@ -72,6 +72,28 @@ Instruction *getSafeInsertionPoint(BasicBlock &BB) {
   return InsertPt == BB.end() ? nullptr : &*InsertPt;
 }
 
+// Safely hoist insertion points above musttail sequences to avoid Verifier
+// aborts. The LLVM Verifier enforces that a musttail call must be immediately
+// followed by ret, with only optional bitcast/extractvalue in between.
+Instruction *adjustForMustTail(Instruction *I) {
+  Instruction *Scan = I;
+  while (Scan) {
+    if (auto *CB = dyn_cast<CallBase>(Scan)) {
+      if (CB->isMustTailCall())
+        return Scan; // Hoist BEFORE the musttail call
+    }
+    // Step backwards over allowed musttail padding
+    if (isa<ReturnInst>(Scan) || isa<BitCastInst>(Scan) ||
+        isa<IntToPtrInst>(Scan) || isa<ExtractValueInst>(Scan) ||
+        isa<DbgInfoIntrinsic>(Scan)) {
+      Scan = Scan->getPrevNode();
+      continue;
+    }
+    break;
+  }
+  return I; // Not a musttail sequence, insert normally
+}
+
 // Memory-safe struct to hold StepMap entries before streaming
 struct StepMapEntry {
   uint32_t stepId;
@@ -225,7 +247,8 @@ struct NovaDebugPass : public PassInfoMixin<NovaDebugPass> {
 
               uint32_t stepId = (fileId << 17) | (instructionCounter & 0x1FFFF);
 
-              IRBuilder<> StepBuilder(&I);
+              Instruction *StepInsertPt = adjustForMustTail(&I);
+              IRBuilder<> StepBuilder(StepInsertPt);
               StepBuilder.SetCurrentDebugLocation(DL);
               StepBuilder.CreateCall(StepFn, {StepBuilder.getInt32(stepId)});
               changed = true;
@@ -237,15 +260,7 @@ struct NovaDebugPass : public PassInfoMixin<NovaDebugPass> {
 
           // 3. INJECT EXIT HOOK (Handles Returns AND Exception Unwinding)
           if (isa<ReturnInst>(&I) || isa<ResumeInst>(&I)) {
-            Instruction *InsertPt = &I;
-
-            // Prevent Verifier abort on MustTail calls
-            if (auto *Prev = I.getPrevNode()) {
-              if (auto *CB = dyn_cast<CallBase>(Prev)) {
-                if (CB->isMustTailCall())
-                  InsertPt = Prev;
-              }
-            }
+            Instruction *InsertPt = adjustForMustTail(&I);
 
             IRBuilder<> ExitBuilder(InsertPt);
             if (InsertPt->getDebugLoc())
@@ -268,6 +283,8 @@ struct NovaDebugPass : public PassInfoMixin<NovaDebugPass> {
     if (EC) {
       errs() << "NovaDebugPass Error: Failed to open step map for writing: "
              << EC.message() << "\n";
+      // Prevent ~raw_ostream assertion on constructor failure
+      OS.clear_error();
     } else {
       llvm::json::OStream J(OS);
       J.object([&] {
@@ -280,12 +297,14 @@ struct NovaDebugPass : public PassInfoMixin<NovaDebugPass> {
         }
       });
 
-      OS.flush();
+      // Explicitly close to force WASI flush/close errors NOW,
+      // before ~raw_fd_ostream tries to close and hits assert(!has_error())
+      OS.close();
 
-      // Acknowledge WASI file closure errors so the WebWorker doesn't crash
       if (OS.has_error()) {
-        errs() << "NovaDebugPass Warning: WASI encountered a flush error on "
-               << stepMapPath << "\n";
+        errs()
+            << "NovaDebugPass Warning: WASI encountered a flush/close error on "
+            << stepMapPath << "\n";
         OS.clear_error();
       }
     }
